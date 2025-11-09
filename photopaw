@@ -1,0 +1,168 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/photopaw/config"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" <<'EOF'
+MEDIA_DIR="$HOME/photos"
+RAW_EXTENSIONS=(
+  "arw" "cr2" "cr3" "dng" "nef" "nrw" "raf" "rw2"
+  "rwl" "sr2" "srf" "srw" "pef" "orf" "r3d" "iiq"
+  "mef" "braw" "3fr" "cap"
+)
+MOV_EXTENSIONS=("mov" "mp4")
+JPEG_EXTENSIONS=("jpg" "jpeg")
+EOF
+    echo "Config created in $CONFIG_FILE"
+fi
+
+source "$CONFIG_FILE"
+
+if [[ -z "${MEDIA_DIR:-}" ]]; then
+    echo "MEDIA_DIR not defined in config" >&2
+    exit 1
+fi
+
+QUIET=false
+RECURSIVE=false
+
+usage() {
+    echo "Usage: $0 [options] <source_dir>"
+    echo
+    echo "Options:"
+    echo "  -s, --set-media-dir <path>   Set MEDIA_DIR in config and exit"
+    echo "  -q, --quiet                  Suppress log output"
+    echo "  -r, --recursive              Process files recursively"
+    echo "  -h, --help                   Show this help message"
+    exit 0
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--set-media-dir)
+            if [[ $# -lt 2 ]]; then
+                echo "error: path missing for --set-media-dir" >&2
+                exit 1
+            elif [[ ! -d "$2" ]]; then
+                echo "$2 is not a directory" >&2
+                exit 1
+            fi
+
+            new_dir="$2"
+            if grep -q '^MEDIA_DIR=' "$CONFIG_FILE"; then
+                sed -i.bak -e "s|^MEDIA_DIR=.*|MEDIA_DIR=\"$new_dir\"|" "$CONFIG_FILE"
+                rm -f "$CONFIG_FILE.bak"
+            else
+                echo "MEDIA_DIR=\"$new_dir\"" >> "$CONFIG_FILE"
+            fi
+            echo "MEDIA_DIR updated to: $new_dir"
+            exit 0
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -r|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "unknown option: $1"
+            usage
+            ;;
+        *)
+            SRC_DIR="$1"
+            shift
+            ;;
+    esac
+done
+
+command -v exiftool >/dev/null 2>&1 || {
+    echo "error: 'exiftool' not found. Please install it." >&2
+    exit 1
+}
+
+if [[ -z "$SRC_DIR" ]]; then
+    usage
+    exit 1
+elif [[ ! -d "$SRC_DIR" ]]; then
+    echo "$SRC_DIR is not a directory." >&2
+    exit 1
+fi
+
+declare -A ALLOWED
+for ext in "${RAW_EXTENSIONS[@]}" "${MOV_EXTENSIONS[@]}" "${JPEG_EXTENSIONS[@]}"; do
+    ALLOWED["$ext"]=1
+done
+
+move_mv() {
+    mv -- "$1" "$2"
+}
+
+move_rsync() {
+    rsync -a --remove-source-files -- "$1" "$2"
+}
+
+src_dev=$(stat -c '%d:%i' "$SRC_DIR")
+dst_dev=$(stat -c '%d:%i' "$MEDIA_DIR")
+
+if [[ "$src_dev" == "$dst_dev" ]]; then
+    mover="move_mv"
+else
+    command -v rsync >/dev/null 2>&1 || {
+        echo "error: 'rsync' not found. Please install it." >&2
+        exit 1
+    }
+    mover="move_rsync"
+fi
+
+process_file() {
+    local f="$1"
+    local ext="$2"
+    local file_date
+
+    file_date=$(exiftool -d "%Y/%m-%d" -DateTimeOriginal -s3 "$f" 2>/dev/null)
+    file_date=${file_date:-"no_date"}
+
+    local target_dir="$MEDIA_DIR/$file_date/$ext"
+    mkdir -p "$target_dir"
+
+    local base="$(basename "$f")"
+    if [[ -e "$target_dir/$base" ]]; then
+        "$mover" "$f" "$target_dir/${base%.*}_$(date +%s%3N).${ext}"
+    else
+        "$mover" "$f" "$target_dir"
+    fi
+
+    $QUIET || echo "$f done"
+}
+
+if $RECURSIVE; then
+    find_opts=()
+else
+    find_opts=(-maxdepth 1)
+fi
+
+while IFS= read -r -d '' f; do
+    ext="${f##*.}"
+    ext="${ext,,}"
+
+    [[ -z "$ext" ]] && continue
+
+    if [[ ${ALLOWED[$ext]} ]]; then
+        process_file "$f" "$ext"
+    fi
+done < <(find "$SRC_DIR" "${find_opts[@]+"${find_opts[@]}"}" \( -path '*/.*' -o -path '*/@*' \) -prune -o -type f -print0)
+
+$QUIET || echo "done!"
+exit 0
